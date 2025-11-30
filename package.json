@@ -1,0 +1,50 @@
+{
+  "name": "@hawiah/postgres",
+  "version": "0.1.0",
+  "description": "PostgreSQL driver with schema-less JSONB storage - lightweight and fast data persistence for Node.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node test/example.js"
+  },
+  "keywords": [
+    "postgresql",
+    "postgres",
+    "pg",
+    "database",
+    "driver",
+    "jsonb",
+    "schema-less",
+    "node-postgres",
+    "sql",
+    "lightweight",
+    "hawiah"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shuruhatik/hawiah-postgres.git"
+  },
+  "homepage": "https://github.com/Shuruhatik/hawiah-postgres#readme",
+  "bugs": {
+    "url": "https://github.com/Shuruhatik/hawiah-postgres/issues"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "INSTALLATION.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
