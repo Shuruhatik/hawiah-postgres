@@ -1,10 +1,9 @@
 {
   "name": "@hawiah/postgres",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "PostgreSQL driver with schema-less JSONB storage - lightweight and fast data persistence for Node.js",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "type": "module",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
