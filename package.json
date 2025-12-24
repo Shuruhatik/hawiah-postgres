@@ -1,6 +1,6 @@
 {
   "name": "@hawiah/postgres",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "PostgreSQL driver with schema-less JSONB storage - lightweight and fast data persistence for Node.js",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

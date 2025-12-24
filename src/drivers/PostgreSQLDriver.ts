@@ -5,50 +5,43 @@ import { IDriver, Query, Data } from '../interfaces/IDriver';
  * PostgreSQL driver configuration options
  */
 export interface PostgreSQLDriverOptions {
-    /**
-     * PostgreSQL connection string (recommended)
-     * Example: 'postgresql://user:password@host:port/database'
-     */
+    /** PostgreSQL connection string (e.g. 'postgres://user:pass@host:port/db') */
     connectionString?: string;
-
-    /**
-     * Or individual connection parameters
-     */
+    /** Database host */
     host?: string;
+    /** Database port (default: 5432) */
     port?: number;
+    /** Database user */
     user?: string;
+    /** Database password */
     password?: string;
+    /** Database name */
     database?: string;
-
-    /**
-     * Table name to use
-     */
+    /** Table name to use for storing data */
     tableName: string;
-
-    /**
-     * SSL configuration (required for cloud providers like Neon, Supabase)
-     */
+    /** SSL configuration (required for some cloud providers) */
     ssl?: boolean | object;
-
-    /**
-     * Connection pool size (default: 10)
-     */
+    /** Connection pool size (default: 10) */
     max?: number;
-
-    /**
-     * Additional PostgreSQL pool options
-     */
+    /** Additional pool configuration */
     poolOptions?: PoolConfig;
 }
 
 /**
  * Driver implementation for PostgreSQL using node-postgres.
- * Provides a schema-less interface to PostgreSQL tables with JSONB storage.
+ * Supports Hybrid Schema (Real Columns + JSONB) for optimized storage and querying.
  */
 export class PostgreSQLDriver implements IDriver {
     private pool: Pool | null = null;
     private tableName: string;
     private config: PoolConfig;
+    private schema: any = null;
+
+    /**
+     * Database type (sql or nosql).
+     * Defaults to 'nosql' until a schema is set via setSchema().
+     */
+    public dbType: 'sql' | 'nosql' = 'nosql';
 
     /**
      * Creates a new instance of PostgreSQLDriver
@@ -71,23 +64,59 @@ export class PostgreSQLDriver implements IDriver {
     }
 
     /**
+     * Sets the schema for the driver.
+     * Switches the driver to SQL mode to use real columns.
+     * @param schema - The schema instance
+     */
+    setSchema(schema: any): void {
+        this.schema = schema;
+        this.dbType = 'sql';
+    }
+
+    /**
      * Connects to the PostgreSQL database.
-     * Creates the table if it doesn't exist.
+     * Creates the table (Hybrid or JSONB only) if it doesn't exist.
      */
     async connect(): Promise<void> {
         this.pool = new Pool(this.config);
 
-        const createTableSQL = `
-            CREATE TABLE IF NOT EXISTS ${this.tableName} (
-                _id VARCHAR(100) PRIMARY KEY,
-                _data JSONB NOT NULL,
-                _createdAt TIMESTAMP NOT NULL,
-                _updatedAt TIMESTAMP NOT NULL
-            )
-        `;
+        let createTableSQL = '';
+
+        if (this.schema && this.dbType === 'sql') {
+            const definition = typeof this.schema.getDefinition === 'function'
+                ? this.schema.getDefinition()
+                : this.schema;
+
+            // Map schema fields to Postgres column definitions
+            const columns = Object.entries(definition).map(([key, type]) => {
+                const sqlType = this.mapHawiahTypeToSQL(type);
+                return `${key} ${sqlType}`; // e.g. "age INTEGER"
+            }).join(', \n');
+
+            // Hybrid Table: Real Columns + _extras JSONB
+            createTableSQL = `
+                CREATE TABLE IF NOT EXISTS ${this.tableName} (
+                    _id VARCHAR(100) PRIMARY KEY,
+                    ${columns}, 
+                    _extras JSONB DEFAULT '{}',
+                    _createdAt TIMESTAMP NOT NULL,
+                    _updatedAt TIMESTAMP NOT NULL
+                )
+            `;
+        } else {
+            // NoSQL Mode: Everything stored in _data JSONB
+            createTableSQL = `
+                CREATE TABLE IF NOT EXISTS ${this.tableName} (
+                    _id VARCHAR(100) PRIMARY KEY,
+                    _data JSONB NOT NULL,
+                    _createdAt TIMESTAMP NOT NULL,
+                    _updatedAt TIMESTAMP NOT NULL
+                )
+            `;
+        }
 
         await this.pool.query(createTableSQL);
-
+        // Ensure standard indexes exist
         await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_${this.tableName}_createdAt ON ${this.tableName}(_createdAt)`);
         await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_${this.tableName}_updatedAt ON ${this.tableName}(_updatedAt)`);
     }
@@ -104,6 +133,7 @@ export class PostgreSQLDriver implements IDriver {
 
     /**
      * Inserts a new record into the database.
+     * Uses real columns if schema is present, otherwise stores as JSONB.
      * @param data - The data to insert
      * @returns The inserted record with ID
      */
@@ -119,39 +149,61 @@ export class PostgreSQLDriver implements IDriver {
             _updatedAt: now.toISOString(),
         };
 
-        const sql = `
-            INSERT INTO ${this.tableName} (_id, _data, _createdAt, _updatedAt)
-            VALUES ($1, $2, $3, $4)
-        `;
+        if (this.schema && this.dbType === 'sql') {
+            const { schemaData, extraData } = this.splitData(record);
+            const schemaKeys = Object.keys(schemaData);
+            const schemaValues = Object.values(schemaData);
 
-        await this.pool!.query(sql, [
-            id,
-            JSON.stringify(record),
-            now,
-            now,
-        ]);
+            // Columns: ID + Schema Fields + Extras + Times
+            const cols = ['_id', ...schemaKeys, '_extras', '_createdAt', '_updatedAt'];
+            // Placeholders: $1, $2, ...
+            const valueParams = cols.map((_, i) => `$${i + 1}`).join(', ');
+            
+            // Values mapped to placeholders
+            const values = [id, ...schemaValues, JSON.stringify(extraData), now, now];
+
+            const sql = `INSERT INTO ${this.tableName} (${cols.join(', ')}) VALUES (${valueParams})`;
+            await this.pool!.query(sql, values);
+
+        } else {
+            const sql = `
+                INSERT INTO ${this.tableName} (_id, _data, _createdAt, _updatedAt)
+                VALUES ($1, $2, $3, $4)
+            `;
+            await this.pool!.query(sql, [id, JSON.stringify(record), now, now]);
+        }
 
         return record;
     }
 
     /**
      * Retrieves records matching the query.
+     * Merges JSONB data with columns if in Hybrid mode.
      * @param query - The query criteria
      * @returns Array of matching records
      */
     async get(query: Query): Promise<Data[]> {
         this.ensureConnected();
 
-        const sql = `SELECT _data FROM ${this.tableName}`;
-        const result = await this.pool!.query(sql);
+        if (this.schema && this.dbType === 'sql') {
+            const sql = `SELECT * FROM ${this.tableName}`;
+            const result = await this.pool!.query(sql);
 
-        const allRecords = result.rows.map((row: any) => row._data);
+            // Merge Real Columns + Extras JSONB
+            const records = result.rows.map(row => this.mergeData(row));
 
-        if (Object.keys(query).length === 0) {
-            return allRecords;
+            if (Object.keys(query).length === 0) return records;
+            return records.filter(record => this.matchesQuery(record, query));
+
+        } else {
+            const sql = `SELECT _data FROM ${this.tableName}`;
+            const result = await this.pool!.query(sql);
+
+            const allRecords = result.rows.map((row: any) => row._data);
+
+            if (Object.keys(query).length === 0) return allRecords;
+            return allRecords.filter((record: any) => this.matchesQuery(record, query));
         }
-
-        return allRecords.filter((record: any) => this.matchesQuery(record, query));
     }
 
     /**
@@ -163,13 +215,15 @@ export class PostgreSQLDriver implements IDriver {
         this.ensureConnected();
 
         if (query._id) {
-            const sql = `SELECT _data FROM ${this.tableName} WHERE _id = $1 LIMIT 1`;
-            const result = await this.pool!.query(sql, [query._id]);
-
-            if (result.rows.length > 0) {
-                return result.rows[0]._data;
+            if (this.schema && this.dbType === 'sql') {
+                const sql = `SELECT * FROM ${this.tableName} WHERE _id = $1 LIMIT 1`;
+                const result = await this.pool!.query(sql, [query._id]);
+                return result.rows.length > 0 ? this.mergeData(result.rows[0]) : null;
+            } else {
+                const sql = `SELECT _data FROM ${this.tableName} WHERE _id = $1 LIMIT 1`;
+                const result = await this.pool!.query(sql, [query._id]);
+                return result.rows.length > 0 ? result.rows[0]._data : null;
             }
-            return null;
         }
 
         const results = await this.get(query);
@@ -178,6 +232,7 @@ export class PostgreSQLDriver implements IDriver {
 
     /**
      * Updates records matching the query.
+     * Updates both columns and extra JSONB data accordingly.
      * @param query - The query criteria
      * @param data - The data to update
      * @returns The number of updated records
@@ -188,12 +243,6 @@ export class PostgreSQLDriver implements IDriver {
         const records = await this.get(query);
         let count = 0;
 
-        const sql = `
-            UPDATE ${this.tableName}
-            SET _data = $1, _updatedAt = $2
-            WHERE _id = $3
-        `;
-
         for (const record of records) {
             const updatedRecord: any = {
                 ...record,
@@ -201,14 +250,38 @@ export class PostgreSQLDriver implements IDriver {
                 _updatedAt: new Date().toISOString(),
             };
 
-            updatedRecord._id = record._id;
-            updatedRecord._createdAt = record._createdAt;
+            const now = new Date();
 
-            await this.pool!.query(sql, [
-                JSON.stringify(updatedRecord),
-                new Date(),
-                record._id,
-            ]);
+            if (this.schema && this.dbType === 'sql') {
+                const { schemaData, extraData } = this.splitData(updatedRecord);
+                const schemaKeys = Object.keys(schemaData);
+                const schemaValues = Object.values(schemaData);
+
+                // Build dynamic SET clause: "col1 = $1, col2 = $2, ..."
+                let setParts = [];
+                let params = [];
+                let idx = 1;
+
+                for (let i = 0; i < schemaKeys.length; i++) {
+                    setParts.push(`${schemaKeys[i]} = $${idx++}`);
+                    params.push(schemaValues[i]);
+                }
+
+                setParts.push(`_extras = $${idx++}`);
+                params.push(JSON.stringify(extraData));
+
+                setParts.push(`_updatedAt = $${idx++}`);
+                params.push(now);
+
+                params.push(record._id); // Last param is ID
+
+                const sql = `UPDATE ${this.tableName} SET ${setParts.join(', ')} WHERE _id = $${idx}`;
+                await this.pool!.query(sql, params);
+
+            } else {
+                const sql = `UPDATE ${this.tableName} SET _data = $1, _updatedAt = $2 WHERE _id = $3`;
+                await this.pool!.query(sql, [JSON.stringify(updatedRecord), now, record._id]);
+            }
             count++;
         }
 
@@ -222,7 +295,6 @@ export class PostgreSQLDriver implements IDriver {
      */
     async delete(query: Query): Promise<number> {
         this.ensureConnected();
-
         const records = await this.get(query);
         const sql = `DELETE FROM ${this.tableName} WHERE _id = $1`;
 
@@ -231,7 +303,6 @@ export class PostgreSQLDriver implements IDriver {
             await this.pool!.query(sql, [record._id]);
             count++;
         }
-
         return count;
     }
 
@@ -242,7 +313,6 @@ export class PostgreSQLDriver implements IDriver {
      */
     async exists(query: Query): Promise<boolean> {
         this.ensureConnected();
-
         const result = await this.getOne(query);
         return result !== null;
     }
@@ -302,19 +372,88 @@ export class PostgreSQLDriver implements IDriver {
     }
 
     /**
+     * Maps Hawiah types to Postgres types.
+     * @param type - The Hawiah schema type
+     * @returns The corresponding PostgreSQL type string
+     * @private
+     */
+    private mapHawiahTypeToSQL(type: any): string {
+        let t = type;
+        if (typeof type === 'object' && type !== null && type.type) {
+            t = type.type;
+        }
+        t = String(t).toUpperCase();
+
+        if (t.includes('STRING') || t.includes('TEXT') || t.includes('EMAIL') || t.includes('URL') || t.includes('CHAR')) return 'TEXT';
+        if (t.includes('UUID')) return 'UUID'; // Native UUID support
+        if (t.includes('NUMBER')) {
+            if (t.includes('INT')) return 'INTEGER';
+            if (t.includes('BIGINT')) return 'BIGINT';
+            return 'REAL'; // Default float
+        }
+        if (t.includes('BOOLEAN')) return 'BOOLEAN';
+        if (t.includes('DATE')) return 'TIMESTAMP';
+        if (t.includes('JSON')) return 'JSONB'; // Native JSON support
+        if (t.includes('BLOB')) return 'BYTEA';
+
+        return 'TEXT';
+    }
+
+    /**
+     * Splits data into schema columns and extra data.
+     * @param data - The full data object
+     * @returns Object containing separate schemaData and extraData
+     * @private
+     */
+    private splitData(data: Data): { schemaData: Data, extraData: Data } {
+        if (!this.schema) return { schemaData: {}, extraData: data };
+
+        const definition = typeof this.schema.getDefinition === 'function'
+            ? this.schema.getDefinition()
+            : this.schema;
+
+        const schemaData: Data = {};
+        const extraData: Data = {};
+
+        for (const [key, value] of Object.entries(data)) {
+            if (key in definition) {
+                schemaData[key] = value;
+            } else if (!['_id', '_createdAt', '_updatedAt'].includes(key)) {
+                extraData[key] = value;
+            }
+        }
+        return { schemaData, extraData };
+    }
+
+    /**
+     * Merges schema columns and extra data back into a single object.
+     * @param row - The raw database row
+     * @returns The fully merged data object
+     * @private
+     */
+    private mergeData(row: any): Data {
+        const { _extras, ...rest } = row;
+        // Postgres pg driver automatically parses JSONB columns into objects
+        const extras = (typeof _extras === 'object' && _extras !== null) ? _extras : 
+                       (typeof _extras === 'string' ? JSON.parse(_extras) : {});
+                       
+        return { ...rest, ...extras };
+    }
+
+    // --- Public Utility Methods ---
+
+    /**
      * Gets the PostgreSQL connection pool.
      * @returns The PostgreSQL connection pool
      */
-    getPool(): Pool | null {
-        return this.pool;
-    }
+    getPool(): Pool | null { return this.pool; }
 
     /**
      * Executes a raw SQL query.
      * WARNING: Use with caution. This bypasses the abstraction layer.
      * @param sql - The SQL query to execute
      * @param params - Optional parameters for the query
-     * @returns Query results
+     * @returns Query results (rows)
      */
     async executeRaw(sql: string, params?: any[]): Promise<any> {
         this.ensureConnected();
